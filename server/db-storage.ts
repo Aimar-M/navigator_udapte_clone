@@ -1,0 +1,1931 @@
+import { db } from "./db";
+import { 
+  User, InsertUser, Trip, InsertTrip, TripMember, InsertTripMember,
+  Activity, InsertActivity, ActivityRSVP, InsertActivityRSVP,
+  Message, InsertMessage, SurveyQuestion, InsertSurveyQuestion,
+  SurveyResponse, InsertSurveyResponse, Expense, InsertExpense,
+  ExpenseSplit, InsertExpenseSplit, Settlement, InsertSettlement,
+  InvitationLink, InsertInvitationLink, Notification, InsertNotification,
+  users, trips, tripMembers, activities, activityRsvp, 
+  messages, surveyQuestions, surveyResponses, expenses, expenseSplits, settlements,
+  polls, pollVotes, invitationLinks, userTripSettings, flightInfo, notifications
+} from "@shared/schema";
+import { eq, and, or, desc, sql, ilike, inArray, isNotNull, lt, ne, asc } from "drizzle-orm";
+import { safeErrorLog } from "./error-logger";
+export class DatabaseStorage {
+  /**
+   * Check if a user has been deleted
+   */
+  async isUserDeleted(userId: number): Promise<boolean> {
+    const user = await this.getUser(userId);
+    return user ? !!user.deletedAt : false;
+  }
+
+  async getUser(id: number): Promise<User | undefined> {
+    const [user] = await db.select().from(users).where(eq(users.id, id));
+    return user || undefined;
+  }
+
+  async getUserByUsername(username: string): Promise<User | undefined> {
+    const [user] = await db.select().from(users).where(eq(users.username, username));
+    return user || undefined;
+  }
+
+  async getUserByEmail(email: string): Promise<User | undefined> {
+    const [user] = await db.select().from(users).where(eq(users.email, email));
+    return user || undefined;
+  }
+
+  async getAllUsers(): Promise<User[]> {
+    return await db.select().from(users);
+  }
+
+  async getUserByEmailConfirmationToken(token: string): Promise<User | undefined> {
+    console.log(`🔍 Looking up user by email confirmation token: ${token.substring(0, 8)}...`);
+    
+    const [user] = await db.select().from(users).where(eq(users.emailConfirmationToken, token));
+    
+    if (user) {
+      console.log(`✅ Found user with token: ${user.username} (ID: ${user.id})`);
+    } else {
+      console.log(`❌ No user found with token: ${token.substring(0, 8)}...`);
+      
+      // Let's check what tokens exist in the database
+      const allUsers = await db.select().from(users);
+      const usersWithTokens = allUsers.filter(u => u.emailConfirmationToken);
+      console.log(`🔍 Debug: Found ${usersWithTokens.length} users with email confirmation tokens`);
+      usersWithTokens.forEach(u => {
+        console.log(`🔍 User ${u.username} (${u.email}) has token: ${u.emailConfirmationToken?.substring(0, 8)}...`);
+      });
+    }
+    
+    return user || undefined;
+  }
+
+  async getUserByGoogleId(googleId: string): Promise<User | undefined> {
+    const [user] = await db.select().from(users).where(eq(users.googleId, googleId));
+    return user || undefined;
+  }
+
+  async getUserById(id: number): Promise<User | undefined> {
+    const [user] = await db.select().from(users).where(eq(users.id, id));
+    return user || undefined;
+  }
+
+  async getUserByPasswordResetToken(token: string): Promise<User | undefined> {
+    const [user] = await db.select().from(users).where(eq(users.passwordResetToken, token));
+    return user || undefined;
+  }
+
+  async cleanupExpiredPasswordResetTokens(): Promise<number> {
+    try {
+      const now = new Date();
+      const result = await db
+        .update(users)
+        .set({
+          passwordResetToken: null,
+          passwordResetExpires: null
+        })
+        .where(and(
+          isNotNull(users.passwordResetExpires),
+          lt(users.passwordResetExpires, now)
+        ));
+      
+      console.log(`🧹 Cleaned up expired password reset tokens`);
+      return 1; // Drizzle doesn't return count for updates, so we assume 1
+    } catch (error) {
+      safeErrorLog('❌ Error cleaning up expired password reset tokens', error);
+      return 0;
+    }
+  }
+
+  async cleanupExpiredEmailConfirmationTokens(): Promise<number> {
+    try {
+      const now = new Date();
+      const result = await db
+        .update(users)
+        .set({
+          emailConfirmationToken: null
+        })
+        .where(and(
+          isNotNull(users.emailConfirmationToken),
+          lt(users.createdAt, new Date(now.getTime() - 24 * 60 * 60 * 1000)) // 24 hours old
+        ));
+      
+      console.log(`🧹 Cleaned up expired email confirmation tokens`);
+      return 1; // Drizzle doesn't return count for updates, so we assume 1
+    } catch (error) {
+      safeErrorLog('❌ Error cleaning up expired email confirmation tokens', error);
+      return 0;
+    }
+  }
+
+  async createUser(insertUser: InsertUser): Promise<User> {
+    console.log(`🔐 Creating user in database:`, {
+      username: insertUser.username,
+      email: insertUser.email,
+      emailConfirmed: insertUser.emailConfirmed,
+      hasToken: !!insertUser.emailConfirmationToken,
+      tokenLength: insertUser.emailConfirmationToken?.length
+    });
+    
+    const [user] = await db
+      .insert(users)
+      .values(insertUser)
+      .returning();
+      
+    console.log(`✅ User created in database:`, {
+      id: user.id,
+      username: user.username,
+      email: user.email,
+      emailConfirmed: user.emailConfirmed,
+      hasToken: !!user.emailConfirmationToken,
+      tokenLength: user.emailConfirmationToken?.length
+    });
+    
+    return user;
+  }
+
+  async updateUser(id: number, userUpdate: Partial<InsertUser>): Promise<User | undefined> {
+    const [user] = await db
+      .update(users)
+      .set(userUpdate)
+      .where(eq(users.id, id))
+      .returning();
+    return user || undefined;
+  }
+
+  /**
+   * Get the earliest member of a trip (excluding a specific user)
+   * Used for transferring organizer role when a user deletes their account
+   */
+  async getEarliestTripMember(tripId: number, excludeUserId: number): Promise<TripMember | undefined> {
+    const [member] = await db
+      .select()
+      .from(tripMembers)
+      .where(
+        and(
+          eq(tripMembers.tripId, tripId),
+          ne(tripMembers.userId, excludeUserId)
+        )
+      )
+      .orderBy(asc(tripMembers.joinedAt))
+      .limit(1);
+    
+    return member || undefined;
+  }
+
+  /**
+   * Anonymize a user account (soft delete)
+   * Sets deletedAt timestamp, clears avatar, but keeps all other data for recovery
+   */
+  async anonymizeUser(userId: number): Promise<boolean> {
+    try {
+      console.log('🔍 anonymizeUser - Starting anonymization for user ID:', userId);
+      
+      const result = await db
+        .update(users)
+        .set({
+          deletedAt: sql`NOW()`,
+          avatar: null,
+          // Keep name in database, but display will show "User not found" in frontend
+        })
+        .where(eq(users.id, userId));
+      
+      console.log('🔍 anonymizeUser - Anonymization result:', result.rowCount > 0);
+      
+      // Delete all sessions for this user
+      // Sessions store user data in sess JSON, so we need to delete by checking the session data
+      // This is a bit tricky - we'll delete expired sessions and let active ones expire naturally
+      // Or we can delete all sessions and let them re-login after recovery
+      await db.execute(sql`
+        DELETE FROM sessions 
+        WHERE sess::text LIKE ${`%"userId":${userId}%`}
+      `);
+      
+      return result.rowCount > 0;
+    } catch (error) {
+      safeErrorLog('❌ anonymizeUser - Error', error);
+      return false;
+    }
+  }
+
+  /**
+   * Set deletion in progress status for a user
+   */
+  async setDeletionInProgress(userId: number, inProgress: boolean): Promise<boolean> {
+    try {
+      await db
+        .update(users)
+        .set({ deletionInProgress: inProgress })
+        .where(eq(users.id, userId));
+      return true;
+    } catch (error) {
+      safeErrorLog('Error setting deletion in progress', error);
+      return false;
+    }
+  }
+
+  /**
+   * Get deletion in progress status for a user
+   */
+  async getDeletionInProgress(userId: number): Promise<boolean> {
+    try {
+      const user = await this.getUser(userId);
+      return user?.deletionInProgress || false;
+    } catch (error) {
+      safeErrorLog('Error getting deletion in progress', error);
+      return false;
+    }
+  }
+
+  /**
+   * Anonymize user account and handle trip relationships
+   * - Stores original organizer ID before transferring
+   * - Transfers organizer role if user is organizer and other members exist
+   * - Never deletes trips (for account recovery)
+   * - Always anonymizes the user
+   */
+  async anonymizeUserAccount(userId: number): Promise<boolean> {
+    try {
+      console.log('🔍 anonymizeUserAccount - Starting account anonymization for user ID:', userId);
+      
+      // Get all trips user is part of (as organizer or member)
+      const userTrips = await this.getTripsByUser(userId);
+      console.log('🔍 anonymizeUserAccount - User trips:', userTrips.length);
+
+      // Process each trip
+      for (const trip of userTrips) {
+        // Get all members of this trip
+        const allMembers = await this.getTripMembers(trip.id);
+        const otherMembers = allMembers.filter(m => m.userId !== userId);
+        
+        console.log(`🔍 anonymizeUserAccount - Trip ${trip.id}: ${allMembers.length} total members, ${otherMembers.length} other members`);
+        
+        // If user is organizer and there are other members, transfer organizer role
+        if (trip.organizer === userId && otherMembers.length > 0) {
+          // Store original organizer ID before transferring
+          await db
+            .update(trips)
+            .set({ originalOrganizerId: userId })
+            .where(eq(trips.id, trip.id));
+
+          const earliestMember = await this.getEarliestTripMember(trip.id, userId);
+          
+          if (earliestMember) {
+            console.log(`🔍 anonymizeUserAccount - Transferring organizer role from ${userId} to ${earliestMember.userId} for trip ${trip.id}`);
+            // Transfer organizer role to earliest member
+            await db
+              .update(trips)
+              .set({ organizer: earliestMember.userId })
+              .where(eq(trips.id, trip.id));
+          } else {
+            console.log(`⚠️ anonymizeUserAccount - No other members found to transfer organizer for trip ${trip.id}`);
+          }
+        }
+        // If user is organizer but no other members, keep them as organizer (trip will show "User not found")
+        // If user is just a member, no action needed - they'll just be anonymized
+      }
+
+      // Anonymize the user
+      return await this.anonymizeUser(userId);
+    } catch (error) {
+      safeErrorLog('❌ anonymizeUserAccount - Error', error);
+      return false;
+    }
+  }
+
+  /**
+   * Restore user as regular member on account recovery
+   * If user was original organizer, they become regular member (current organizer stays)
+   */
+  async restoreUserOnRecovery(userId: number): Promise<boolean> {
+    try {
+      console.log('🔍 restoreUserOnRecovery - Restoring user ID:', userId);
+      
+      // Get all trips where user was original organizer
+      const tripsAsOriginalOrganizer = await db
+        .select()
+        .from(trips)
+        .where(eq(trips.originalOrganizerId, userId));
+
+      console.log(`🔍 restoreUserOnRecovery - User was original organizer of ${tripsAsOriginalOrganizer.length} trips`);
+
+      // User becomes regular member (current organizer stays as organizer)
+      // No need to change organizer - current organizer remains
+      // originalOrganizerId is kept for historical tracking
+
+      // Clear deletion in progress flag
+      await this.setDeletionInProgress(userId, false);
+
+      // Restore user account (clear deleted_at, etc.)
+      await db
+        .update(users)
+        .set({ 
+          deletedAt: null,
+          accountRecoveryToken: null,
+          accountRecoveryExpires: null
+        })
+        .where(eq(users.id, userId));
+
+      return true;
+    } catch (error) {
+      safeErrorLog('❌ restoreUserOnRecovery - Error', error);
+      return false;
+    }
+  }
+
+  /**
+   * Legacy method - kept for backwards compatibility
+   * Now calls anonymizeUserAccount instead of hard delete
+   */
+  async deleteUser(id: number): Promise<boolean> {
+    return this.anonymizeUserAccount(id);
+  }
+
+  async createTrip(insertTrip: InsertTrip): Promise<Trip> {
+    const [trip] = await db
+      .insert(trips)
+      .values(insertTrip)
+      .returning();
+    
+    // Automatically add the organizer as a confirmed member with confirmed RSVP status and admin flag
+    await this.addTripMember({
+      tripId: trip.id,
+      userId: insertTrip.organizer,
+      status: "confirmed",
+      rsvpStatus: "confirmed",
+      isAdmin: true
+    });
+    
+    return trip;
+  }
+
+  async getTrip(id: number): Promise<Trip | undefined> {
+    const [trip] = await db.select().from(trips).where(eq(trips.id, id));
+    return trip || undefined;
+  }
+
+  // async getTripsByUser(userId: number): Promise<Trip[]> {
+  //   // Get trips where user is a member
+  //   const members = await db
+  //     .select()
+  //     .from(tripMembers)
+  //     .where(eq(tripMembers.userId, userId));
+    
+  //   // Get trips where user is the organizer (in case membership wasn't added properly)
+  //   const organizedTrips = await db
+  //     .select()
+  //     .from(trips) 
+  //     .where(eq(trips.organizer, userId));
+    
+  //   // Combine member trips and organized trips
+  //   const memberTrips = members.length > 0 ? await Promise.all(
+  //     members.map(member => 
+  //       db.select().from(trips).where(eq(trips.id, member.tripId))
+  //     )
+  //   ).then(results => results.flatMap(t => t)) : [];
+    
+  //   // Merge and deduplicate trips
+  //   const allTrips = [...memberTrips, ...organizedTrips];
+  //   const uniqueTrips = allTrips.filter((trip, index, array) => 
+  //     array.findIndex(t => t.id === trip.id) === index
+  //   );
+    
+  //   return uniqueTrips;
+  // }
+
+  async getTripsByUser(userId: number) {
+    // Get trips where user is the organizer, ordered by start date
+    const organizerTrips = await db
+      .select()
+      .from(trips)
+      .where(eq(trips.organizer, userId))
+      .orderBy(asc(trips.startDate));
+  
+    // Get trips where user is a member
+    const memberTripIds = await db
+      .select({ tripId: tripMembers.tripId })
+      .from(tripMembers)
+      .where(eq(tripMembers.userId, userId));
+  
+    const memberTrips = await db
+      .select()
+      .from(trips)
+      .where(inArray(trips.id, memberTripIds.map(m => m.tripId)))
+      .orderBy(asc(trips.startDate));
+  
+    // Combine and deduplicate, then sort by start date
+    const allTrips = [...organizerTrips, ...memberTrips].filter(
+      (trip, index, self) => self.findIndex(t => t.id === trip.id) === index
+    );
+  
+    // Sort by start date (ascending - earliest first)
+    allTrips.sort((a, b) => {
+      const dateA = a.startDate ? new Date(a.startDate).getTime() : 0;
+      const dateB = b.startDate ? new Date(b.startDate).getTime() : 0;
+      return dateA - dateB;
+    });
+  
+    return allTrips;
+  }
+
+  async updateTrip(id: number, tripUpdate: Partial<InsertTrip>): Promise<Trip | undefined> {
+    const [updatedTrip] = await db
+      .update(trips)
+      .set(tripUpdate)
+      .where(eq(trips.id, id))
+      .returning();
+    
+    return updatedTrip || undefined;
+  }
+
+  async deleteTrip(id: number): Promise<boolean> {
+    // Delete all related records in the correct order to avoid foreign key constraint violations
+    await db.transaction(async (tx) => {
+      // 1. Delete expense splits (references expenses)
+      const tripExpenses = await tx.select({ id: expenses.id })
+        .from(expenses)
+        .where(eq(expenses.tripId, id));
+      const expenseIds = tripExpenses.map(e => e.id);
+      if (expenseIds.length > 0) {
+        await tx.delete(expenseSplits)
+          .where(inArray(expenseSplits.expenseId, expenseIds));
+      }
+
+      // 2. Delete expenses (references trips)
+      await tx.delete(expenses)
+        .where(eq(expenses.tripId, id));
+
+      // 3. Delete activity RSVPs (references activities)
+      const tripActivities = await tx.select({ id: activities.id })
+        .from(activities)
+        .where(eq(activities.tripId, id));
+      const activityIds = tripActivities.map(a => a.id);
+      if (activityIds.length > 0) {
+        await tx.delete(activityRsvp)
+          .where(inArray(activityRsvp.activityId, activityIds));
+      }
+
+      // 4. Delete activities (references trips)
+      await tx.delete(activities)
+        .where(eq(activities.tripId, id));
+
+      // 5. Delete poll votes (references polls)
+      const tripPolls = await tx.select({ id: polls.id })
+        .from(polls)
+        .where(eq(polls.tripId, id));
+      const pollIds = tripPolls.map(p => p.id);
+      if (pollIds.length > 0) {
+        await tx.delete(pollVotes)
+          .where(inArray(pollVotes.pollId, pollIds));
+      }
+
+      // 6. Delete polls (references trips)
+      await tx.delete(polls)
+        .where(eq(polls.tripId, id));
+
+      // 7. Delete survey responses (references survey questions)
+      const tripSurveyQuestions = await tx.select({ id: surveyQuestions.id })
+        .from(surveyQuestions)
+        .where(eq(surveyQuestions.tripId, id));
+      const surveyQuestionIds = tripSurveyQuestions.map(q => q.id);
+      if (surveyQuestionIds.length > 0) {
+        await tx.delete(surveyResponses)
+          .where(inArray(surveyResponses.questionId, surveyQuestionIds));
+      }
+
+      // 8. Delete survey questions (references trips)
+      await tx.delete(surveyQuestions)
+        .where(eq(surveyQuestions.tripId, id));
+
+      // 9. Delete messages (references trips)
+      await tx.delete(messages)
+        .where(eq(messages.tripId, id));
+
+      // 10. Delete trip members (references trips)
+      await tx.delete(tripMembers)
+        .where(eq(tripMembers.tripId, id));
+
+      // 11. Delete user trip settings (references trips)
+      await tx.delete(userTripSettings)
+        .where(eq(userTripSettings.tripId, id));
+
+      // 12. Delete invitation links (references trips)
+      await tx.delete(invitationLinks)
+        .where(eq(invitationLinks.tripId, id));
+
+      // 13. Delete flight info (references trips)
+      await tx.delete(flightInfo)
+        .where(eq(flightInfo.tripId, id));
+
+      // 14. Delete settlements (references trips)
+      await tx.delete(settlements)
+        .where(eq(settlements.tripId, id));
+
+      // 15. Finally, delete the trip itself
+      await tx.delete(trips)
+        .where(eq(trips.id, id));
+    });
+
+    return true;
+  }
+
+  async addTripMember(member: InsertTripMember): Promise<TripMember> {
+    try {
+      const [tripMember] = await db
+        .insert(tripMembers)
+        .values(member)
+        .returning();
+      
+      return tripMember;
+    } catch (error) {
+      // Check if the member already exists and return it
+      const [existingMember] = await db
+        .select()
+        .from(tripMembers)
+        .where(
+          and(
+            eq(tripMembers.tripId, member.tripId),
+            eq(tripMembers.userId, member.userId)
+          )
+        );
+      
+      if (existingMember) return existingMember;
+      throw error;
+    }
+  }
+
+  async getTripMembers(tripId: number): Promise<TripMember[]> {
+    // Get all trip members and filter out deleted users
+    const allMembers = await db
+      .select()
+      .from(tripMembers)
+      .where(eq(tripMembers.tripId, tripId));
+    
+    // Filter out members whose users have been deleted
+    const activeMembers = await Promise.all(
+      allMembers.map(async (member) => {
+        const user = await this.getUser(member.userId);
+        if (user && user.deletedAt) {
+          return null; // Filter out deleted users
+        }
+        return member;
+      })
+    );
+    
+    return activeMembers.filter((member): member is TripMember => member !== null);
+  }
+
+  async getTripMembershipsByUser(userId: number): Promise<TripMember[]> {
+    return db
+      .select()
+      .from(tripMembers)
+      .where(eq(tripMembers.userId, userId));
+  }
+
+  async getTripMember(tripId: number, userId: number): Promise<TripMember | undefined> {
+    const [member] = await db
+      .select()
+      .from(tripMembers)
+      .where(
+        and(
+          eq(tripMembers.tripId, tripId),
+          eq(tripMembers.userId, userId)
+        )
+      );
+    
+    return member || undefined;
+  }
+
+  async updateTripMemberStatus(tripId: number, userId: number, status: string): Promise<TripMember | undefined> {
+    const [updatedMember] = await db
+      .update(tripMembers)
+      .set({ status })
+      .where(
+        and(
+          eq(tripMembers.tripId, tripId),
+          eq(tripMembers.userId, userId)
+        )
+      )
+      .returning();
+    
+    return updatedMember || undefined;
+  }
+
+  async updateTripMemberAdminStatus(tripId: number, userId: number, isAdmin: boolean): Promise<TripMember | undefined> {
+    const [updatedMember] = await db
+      .update(tripMembers)
+      .set({ isAdmin })
+      .where(
+        and(
+          eq(tripMembers.tripId, tripId),
+          eq(tripMembers.userId, userId)
+        )
+      )
+      .returning();
+    
+    return updatedMember || undefined;
+  }
+
+  async updateTripMemberRSVPStatus(tripId: number, userId: number, rsvpStatus: string): Promise<TripMember | undefined> {
+    // Get trip to check if down payment is required
+    const trip = await this.getTrip(tripId);
+    if (!trip) {
+      throw new Error('Trip not found');
+    }
+
+    // Get current member to check payment status
+    const currentMember = await this.getTripMemberWithPaymentInfo(tripId, userId);
+    const paymentConfirmed = currentMember?.paymentStatus === 'confirmed';
+
+    // Determine what to update
+    const updateData: any = { 
+      // Only override to 'pending' if payment is NOT yet confirmed
+      rsvpStatus: trip.requiresDownPayment && rsvpStatus === 'confirmed' && !paymentConfirmed ? 'pending' : rsvpStatus,
+      rsvpDate: new Date()
+    };
+
+    // If confirming RSVP and no down payment required, automatically confirm member status
+    if (rsvpStatus === 'confirmed' && !trip.requiresDownPayment) {
+      updateData.status = 'confirmed';
+    }
+    // If confirming RSVP but down payment IS required and payment IS confirmed, grant full access
+    else if (rsvpStatus === 'confirmed' && trip.requiresDownPayment && paymentConfirmed) {
+      updateData.status = 'confirmed';
+    }
+    // If confirming RSVP but down payment IS required and payment NOT confirmed, keep both as pending
+    else if (rsvpStatus === 'confirmed' && trip.requiresDownPayment && !paymentConfirmed) {
+      updateData.status = 'pending';
+    }
+    // If declining RSVP, set member status to declined
+    else if (rsvpStatus === 'declined') {
+      updateData.status = 'declined';
+    }
+    // If maybe RSVP, keep member status as pending but update RSVP status
+    else if (rsvpStatus === 'maybe') {
+      // Keep status as pending, just update RSVP status
+    }
+
+    const [updatedMember] = await db
+      .update(tripMembers)
+      .set(updateData)
+      .where(
+        and(
+          eq(tripMembers.tripId, tripId),
+          eq(tripMembers.userId, userId)
+        )
+      )
+      .returning();
+    
+    return updatedMember || undefined;
+  }
+
+  async updateTripMemberPaymentInfo(
+    tripId: number, 
+    userId: number, 
+    paymentData: {
+      paymentMethod?: string;
+      paymentStatus?: string;
+      paymentAmount?: string;
+      paymentSubmittedAt?: Date;
+      paymentConfirmedAt?: Date;
+    }
+  ): Promise<TripMember | undefined> {
+    const [updatedMember] = await db
+      .update(tripMembers)
+      .set(paymentData)
+      .where(
+        and(
+          eq(tripMembers.tripId, tripId),
+          eq(tripMembers.userId, userId)
+        )
+      )
+      .returning();
+    
+    return updatedMember || undefined;
+  }
+
+  async getTripMemberWithPaymentInfo(tripId: number, userId: number): Promise<TripMember | undefined> {
+    const [member] = await db
+      .select()
+      .from(tripMembers)
+      .where(
+        and(
+          eq(tripMembers.tripId, tripId),
+          eq(tripMembers.userId, userId)
+        )
+      );
+    
+    return member || undefined;
+  }
+
+  async analyzeMemberRemovalEligibility(tripId: number, userId: number): Promise<{
+    canRemove: boolean;
+    reason?: string;
+    balance: number;
+    manualExpenseBalance: number;
+    prepaidActivityBalance: number;
+    prepaidActivitiesOwed: any[];
+    suggestions?: string[];
+  }> {
+    // Get trip to check removal logic version
+    const trip = await this.getTrip(tripId);
+    if (!trip) {
+      throw new Error('Trip not found');
+    }
+
+    // For legacy trips, use simple balance check
+    if ((trip.removalLogicVersion || 0) < 2) {
+      const balances = await this.calculateExpenseBalances(tripId);
+      const userBalance = balances.find(b => b.userId === userId);
+      const balance = userBalance?.netBalance || 0;
+      
+      return {
+        canRemove: Math.abs(balance) < 0.01,
+        reason: Math.abs(balance) >= 0.01 ? "User has unsettled expenses" : undefined,
+        balance,
+        manualExpenseBalance: balance,
+        prepaidActivityBalance: 0,
+        prepaidActivitiesOwed: []
+      };
+    }
+
+    // Enhanced logic for version 2+
+    const balances = await this.calculateExpenseBalances(tripId);
+    const userBalance = balances.find(b => b.userId === userId);
+    const totalBalance = userBalance?.netBalance || 0;
+
+    // Get all expenses involving this user
+    const userExpenses = await db
+      .select()
+      .from(expenses)
+      .where(
+        and(
+          eq(expenses.tripId, tripId),
+          eq(expenses.paidBy, userId)
+        )
+      );
+
+    // Get prepaid activities created by this user
+    const prepaidActivities = await db
+      .select({
+        id: activities.id,
+        name: activities.name,
+        cost: activities.cost,
+        paymentType: activities.paymentType
+      })
+      .from(activities)
+      .where(
+        and(
+          eq(activities.tripId, tripId),
+          eq(activities.createdBy, userId),
+          eq(activities.paymentType, 'prepaid')
+        )
+      );
+
+    // Calculate balance from prepaid activities this user organized
+    let prepaidActivityBalance = 0;
+    const prepaidActivitiesOwed = [];
+    
+    for (const activity of prepaidActivities) {
+      // Find expenses auto-created for this activity
+      const activityExpenses = userExpenses.filter(e => e.activityId === activity.id);
+      
+      if (activityExpenses.length > 0) {
+        const activityExpenseAmount = activityExpenses.reduce((sum, e) => 
+          sum + parseFloat(e.amount.toString()), 0
+        );
+        
+        // Get splits for these expenses to calculate what others owe
+        const expenseIds = activityExpenses.map(e => e.id);
+        const splits = expenseIds.length > 0 ? await db
+          .select()
+          .from(expenseSplits)
+          .where(inArray(expenseSplits.expenseId, expenseIds)) : [];
+        
+        const amountOwedByOthers = splits
+          .filter(split => split.userId !== userId)
+          .reduce((sum, split) => sum + parseFloat(split.amount.toString()), 0);
+        
+        if (amountOwedByOthers > 0.01) {
+          prepaidActivityBalance += amountOwedByOthers;
+          prepaidActivitiesOwed.push({
+            activityId: activity.id,
+            activityName: activity.name,
+            amountOwed: amountOwedByOthers
+          });
+        }
+      }
+    }
+
+    const manualExpenseBalance = totalBalance - prepaidActivityBalance;
+
+    // Determine removal eligibility
+    let canRemove = true;
+    let reason = undefined;
+    const suggestions = [];
+
+    if (prepaidActivityBalance > 0.01) {
+      canRemove = false;
+      reason = `User ${userBalance?.name || 'Unknown'} is owed money for prepaid activities they organized. Please cancel or reassign those activities before removing this user.`;
+      suggestions.push('Reassign organizer to another trip member');
+      suggestions.push('Cancel the prepaid activities');
+    } else if (Math.abs(manualExpenseBalance) > 0.01) {
+      canRemove = false;
+      reason = `User ${userBalance?.name || 'Unknown'} has unsettled expenses. Please settle up before removing them.`;
+      suggestions.push('Use the settlement workflow to clear outstanding balances');
+    }
+
+    return {
+      canRemove,
+      reason,
+      balance: totalBalance,
+      manualExpenseBalance,
+      prepaidActivityBalance,
+      prepaidActivitiesOwed,
+      suggestions
+    };
+  }
+
+  async removeTripMember(tripId: number, userId: number): Promise<boolean> {
+    // Check removal eligibility first
+    const eligibility = await this.analyzeMemberRemovalEligibility(tripId, userId);
+    if (!eligibility.canRemove) {
+      throw new Error(eligibility.reason || 'User cannot be removed');
+    }
+
+    // Get trip to check removal logic version
+    const trip = await this.getTrip(tripId);
+    if (!trip) {
+      throw new Error('Trip not found');
+    }
+
+    // For version 2+, remove prepaid activities created by the user
+    if ((trip.removalLogicVersion || 0) >= 2) {
+      await this.removePrepaidActivitiesCreatedByUser(tripId, userId);
+    }
+
+    // Remove the user from trip members
+    const result = await db
+      .delete(tripMembers)
+      .where(
+        and(
+          eq(tripMembers.tripId, tripId),
+          eq(tripMembers.userId, userId)
+        )
+      );
+    
+    return result.rowCount ? result.rowCount > 0 : false;
+  }
+
+  private async removePrepaidActivitiesCreatedByUser(tripId: number, userId: number): Promise<void> {
+    // Get prepaid activities created by this user
+    const prepaidActivities = await db
+      .select()
+      .from(activities)
+      .where(
+        and(
+          eq(activities.tripId, tripId),
+          eq(activities.createdBy, userId),
+          eq(activities.paymentType, 'prepaid')
+        )
+      );
+
+    for (const activity of prepaidActivities) {
+      // Delete related expenses
+      await db
+        .delete(expenses)
+        .where(eq(expenses.activityId, activity.id));
+      
+      // Delete activity RSVPs
+      await db
+        .delete(activityRsvp)
+        .where(eq(activityRsvp.activityId, activity.id));
+      
+      // Delete the activity
+      await db
+        .delete(activities)
+        .where(eq(activities.id, activity.id));
+    }
+
+    // Update free/included activities to show they were created by a removed user
+    await db
+      .update(activities)
+      .set({ 
+        createdBy: null,
+        description: sql`COALESCE(${activities.description}, '') || CASE WHEN COALESCE(${activities.description}, '') = '' THEN 'Created by a removed user' ELSE ' (Created by a removed user)' END`
+      })
+      .where(
+        and(
+          eq(activities.tripId, tripId),
+          eq(activities.createdBy, userId)
+        )
+      );
+  }
+
+  async createActivity(activity: InsertActivity): Promise<Activity> {
+    // Ensure dates are properly handled as timestamps
+    const activityData = {
+      ...activity,
+      date: activity.date instanceof Date ? activity.date : new Date(activity.date),
+      checkInDate: activity.checkInDate ? (activity.checkInDate instanceof Date ? activity.checkInDate : new Date(activity.checkInDate)) : null,
+      checkOutDate: activity.checkOutDate ? (activity.checkOutDate instanceof Date ? activity.checkOutDate : new Date(activity.checkOutDate)) : null
+    };
+    
+    const [newActivity] = await db
+      .insert(activities)
+      .values(activityData)
+      .returning();
+    
+    return newActivity;
+  }
+
+  async getActivitiesByTrip(tripId: number): Promise<Activity[]> {
+    return db
+      .select()
+      .from(activities)
+      .where(eq(activities.tripId, tripId))
+      .orderBy(activities.date);
+  }
+
+  async getActivity(id: number): Promise<Activity | undefined> {
+    const [activity] = await db
+      .select()
+      .from(activities)
+      .where(eq(activities.id, id));
+    
+    return activity || undefined;
+  }
+
+  async updateActivity(id: number, activityUpdate: Partial<InsertActivity>): Promise<Activity | undefined> {
+    const [updatedActivity] = await db
+      .update(activities)
+      .set(activityUpdate)
+      .where(eq(activities.id, id))
+      .returning();
+    
+    return updatedActivity || undefined;
+  }
+
+  async deleteActivity(id: number): Promise<boolean> {
+    // First, delete associated expenses and their splits
+    const activityExpenses = await db
+      .select()
+      .from(expenses)
+      .where(eq(expenses.activityId, id));
+    
+    for (const expense of activityExpenses) {
+      // Delete expense splits first
+      await db
+        .delete(expenseSplits)
+        .where(eq(expenseSplits.expenseId, expense.id));
+      
+      // Then delete the expense
+      await db
+        .delete(expenses)
+        .where(eq(expenses.id, expense.id));
+    }
+    
+    // Delete activity RSVPs
+    await db
+      .delete(activityRsvp)
+      .where(eq(activityRsvp.activityId, id));
+    
+    // Finally, delete the activity
+    const result = await db
+      .delete(activities)
+      .where(eq(activities.id, id));
+    
+    return result.rowCount ? result.rowCount > 0 : false;
+  }
+
+  async createActivityRSVP(rsvp: InsertActivityRSVP): Promise<ActivityRSVP> {
+    try {
+      const [newRsvp] = await db
+        .insert(activityRsvp)
+        .values(rsvp)
+        .returning();
+      
+      return newRsvp;
+    } catch (error) {
+      // Check if the RSVP already exists
+      const [existingRsvp] = await db
+        .select()
+        .from(activityRsvp)
+        .where(
+          and(
+            eq(activityRsvp.activityId, rsvp.activityId),
+            eq(activityRsvp.userId, rsvp.userId)
+          )
+        );
+      
+      if (existingRsvp) return existingRsvp;
+      throw error;
+    }
+  }
+
+  async getActivityRSVPs(activityId: number): Promise<ActivityRSVP[]> {
+    return db
+      .select()
+      .from(activityRsvp)
+      .where(eq(activityRsvp.activityId, activityId));
+  }
+
+  async updateActivityRSVP(activityId: number, userId: number, status: string): Promise<ActivityRSVP | undefined> {
+    const [updatedRsvp] = await db
+      .update(activityRsvp)
+      .set({ status })
+      .where(
+        and(
+          eq(activityRsvp.activityId, activityId),
+          eq(activityRsvp.userId, userId)
+        )
+      )
+      .returning();
+    
+    return updatedRsvp || undefined;
+  }
+
+  async transferActivityOwnership(activityId: number, newOwnerId: number): Promise<Activity | undefined> {
+    // Get the current activity to find the old owner
+    const currentActivity = await this.getActivity(activityId);
+    if (!currentActivity) {
+      throw new Error('Activity not found');
+    }
+    
+    const oldOwnerId = currentActivity.createdBy;
+    
+    // Update the activity ownership
+    const [updatedActivity] = await db
+      .update(activities)
+      .set({ createdBy: newOwnerId })
+      .where(eq(activities.id, activityId))
+      .returning();
+    
+    if (!updatedActivity) {
+      throw new Error('Failed to update activity ownership');
+    }
+    
+    // Update any associated expenses to reflect the new owner
+    // First, update expenses that have direct activityId reference
+    await db
+      .update(expenses)
+      .set({ paidBy: newOwnerId })
+      .where(eq(expenses.activityId, activityId));
+    
+    // Also update expenses that were created for this activity based on title pattern
+    const titlePattern = `Activity: ${updatedActivity.name}%`;
+    await db
+      .update(expenses)
+      .set({ paidBy: newOwnerId })
+      .where(sql`trip_id = ${updatedActivity.tripId} AND paid_by = ${oldOwnerId} AND title ILIKE ${titlePattern}`);
+    
+    // Remove the old owner from the activity's RSVP list since they're no longer participating
+    await db.execute(sql`DELETE FROM activity_rsvp WHERE activity_id = ${activityId} AND user_id = ${oldOwnerId}`);
+    
+    // Update expense splits to remove the old owner and recalculate amounts
+    // Find all expenses related to this activity
+    const activityExpenses = await db
+      .select()
+      .from(expenses)
+      .where(and(
+        eq(expenses.activityId, activityId),
+        eq(expenses.tripId, updatedActivity.tripId)
+      ));
+    
+    for (const expense of activityExpenses) {
+      // Get current participants (who are marked as "going" after RSVP updates above)
+      const currentRSVPs = await db
+        .select()
+        .from(activityRsvp)
+        .where(and(
+          eq(activityRsvp.activityId, activityId),
+          eq(activityRsvp.status, 'going')
+        ));
+      
+      const participantIds = currentRSVPs.map(rsvp => rsvp.userId);
+      
+      // Always recalculate splits for activity expenses to ensure only current participants are included
+      if (participantIds.length > 0) {
+        // Remove all existing splits and recreate with current participants only
+        await this.removeExpenseSplits(expense.id);
+        
+        const costPerPerson = parseFloat(expense.amount.toString()) / participantIds.length;
+        
+        // Create new splits for current participants only
+        for (const userId of participantIds) {
+          await this.createExpenseSplit({
+            expenseId: expense.id,
+            userId: userId,
+            amount: costPerPerson.toFixed(2)
+          });
+        }
+      }
+    }
+    
+    // Ensure the new owner has an RSVP entry marked as "going" if they don't already
+    const existingRSVP = await db.execute(sql`SELECT * FROM activity_rsvp WHERE activity_id = ${activityId} AND user_id = ${newOwnerId} LIMIT 1`);
+    
+    if (existingRSVP.rows.length === 0) {
+      // Create new RSVP for the new owner
+      await db.execute(sql`INSERT INTO activity_rsvp (activity_id, user_id, status) VALUES (${activityId}, ${newOwnerId}, 'going')`);
+    } else {
+      // Update existing RSVP to "going"
+      await db.execute(sql`UPDATE activity_rsvp SET status = 'going' WHERE activity_id = ${activityId} AND user_id = ${newOwnerId}`);
+    }
+    
+    return updatedActivity;
+  }
+
+  async createMessage(message: InsertMessage): Promise<Message> {
+    const [newMessage] = await db
+      .insert(messages)
+      .values({
+        ...message,
+        timestamp: new Date()
+      })
+      .returning();
+    
+    return newMessage;
+  }
+
+  async getMessagesByTrip(tripId: number): Promise<Message[]> {
+    return db
+      .select()
+      .from(messages)
+      .where(eq(messages.tripId, tripId))
+      .orderBy(messages.timestamp);
+  }
+
+  async createSurveyQuestion(question: InsertSurveyQuestion): Promise<SurveyQuestion> {
+    const [newQuestion] = await db
+      .insert(surveyQuestions)
+      .values(question)
+      .returning();
+    
+    return newQuestion;
+  }
+
+  async getSurveyQuestionsByTrip(tripId: number): Promise<SurveyQuestion[]> {
+    return db
+      .select()
+      .from(surveyQuestions)
+      .where(eq(surveyQuestions.tripId, tripId));
+  }
+
+  async createSurveyResponse(response: InsertSurveyResponse): Promise<SurveyResponse> {
+    const [newResponse] = await db
+      .insert(surveyResponses)
+      .values(response)
+      .returning();
+    
+    return newResponse;
+  }
+
+  async getSurveyResponses(questionId: number): Promise<SurveyResponse[]> {
+    return db
+      .select()
+      .from(surveyResponses)
+      .where(eq(surveyResponses.questionId, questionId));
+  }
+
+  // Expense tracking methods - rebuilt for activity integration
+  async createExpense(expense: InsertExpense): Promise<Expense> {
+    const [newExpense] = await db
+      .insert(expenses)
+      .values(expense)
+      .returning();
+    
+    return newExpense;
+  }
+
+  async createExpenseSplit(split: InsertExpenseSplit): Promise<ExpenseSplit> {
+    const [newSplit] = await db
+      .insert(expenseSplits)
+      .values(split)
+      .returning();
+    
+    return newSplit;
+  }
+
+  async getExpensesByTrip(tripId: number): Promise<any[]> {
+    const tripExpenses = await db
+      .select({
+        id: expenses.id,
+        tripId: expenses.tripId,
+        title: expenses.title,
+        amount: expenses.amount,
+        currency: expenses.currency,
+        category: expenses.category,
+        date: expenses.date,
+        description: expenses.description,
+        paidBy: expenses.paidBy,
+        activityId: expenses.activityId,
+        isSettled: expenses.isSettled,
+        receiptUrl: expenses.receiptUrl,
+        createdAt: expenses.createdAt,
+        updatedAt: expenses.updatedAt,
+        paidByUser: {
+          id: users.id,
+          name: users.name,
+          username: users.username
+        },
+        activity: {
+          id: activities.id,
+          name: activities.name
+        }
+      })
+      .from(expenses)
+      .leftJoin(users, eq(expenses.paidBy, users.id))
+      .leftJoin(activities, eq(expenses.activityId, activities.id))
+      .where(eq(expenses.tripId, tripId))
+      .orderBy(desc(expenses.createdAt));
+
+    // Get splits for each expense
+    const expensesWithSplits = await Promise.all(
+      tripExpenses.map(async (expense) => {
+        const splits = await db
+          .select({
+            id: expenseSplits.id,
+            userId: expenseSplits.userId,
+            amount: expenseSplits.amount,
+            isPaid: expenseSplits.isPaid,
+            paidAt: expenseSplits.paidAt,
+            user: {
+              id: users.id,
+              name: users.name,
+              username: users.username
+            }
+          })
+          .from(expenseSplits)
+          .leftJoin(users, eq(expenseSplits.userId, users.id))
+          .where(eq(expenseSplits.expenseId, expense.id));
+
+        return {
+          ...expense,
+          shares: splits
+        };
+      })
+    );
+
+    // Add only confirmed settlements as settlement transactions (rejected settlements are excluded)
+    const processedSettlements = await db
+      .select()
+      .from(settlements)
+      .where(
+        and(
+          eq(settlements.tripId, tripId),
+          eq(settlements.status, 'confirmed')
+        )
+      )
+      .orderBy(desc(settlements.updatedAt));
+
+    // Convert settlements to expense-like format with user details
+    const settlementTransactions = await Promise.all(
+      processedSettlements.map(async (settlement) => {
+        const payer = await this.getUser(settlement.payerId);
+        const payee = await this.getUser(settlement.payeeId);
+        
+        return {
+          id: `settlement-${settlement.id}`,
+          title: `Payment: ${payer?.name || payer?.username || 'Unknown'} → ${payee?.name || payee?.username || 'Unknown'}`,
+          amount: parseFloat(settlement.amount),
+          category: 'settlement',
+          date: settlement.confirmedAt?.toISOString() || new Date().toISOString(),
+          description: settlement.notes || `${settlement.paymentMethod ? settlement.paymentMethod.charAt(0).toUpperCase() + settlement.paymentMethod.slice(1) : 'Cash'} payment settlement`,
+          paidBy: settlement.payerId,
+          paidByUser: {
+            id: payer?.id,
+            name: payer?.name || payer?.username || 'Unknown',
+            username: payer?.username
+          },
+          activityId: null,
+          isSettlement: true,
+          status: settlement.status,
+          paymentMethod: settlement.paymentMethod,
+          shares: []
+        };
+      })
+    );
+
+    // Combine expenses and settlements
+    const allTransactions = [...expensesWithSplits, ...settlementTransactions];
+    
+    // Sort by date (newest first)
+    allTransactions.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+
+    return allTransactions;
+  }
+
+  async calculateExpenseBalances(tripId: number): Promise<any[]> {
+    try {
+      // Get all trip members
+      const tripMembers = await this.getTripMembers(tripId);
+      const memberIds = tripMembers.map(m => m.userId);
+
+      // Get only real expenses from database (excludes settlement transactions)
+      const realExpenses = await db
+        .select()
+        .from(expenses)
+        .where(eq(expenses.tripId, tripId));
+
+      // Get all expense splits for these real expenses
+      const allSplits = await db
+        .select()
+        .from(expenseSplits);
+
+      // Filter splits to only those belonging to real expenses
+      const relevantSplits = allSplits.filter(split => 
+        realExpenses.some(expense => expense.id === split.expenseId)
+      );
+
+      console.log(`Found ${realExpenses.length} real expenses and ${relevantSplits.length} splits`);
+      
+      // Get all unique user IDs involved in expenses (both current members and removed users)
+      const paidBySet = new Set<number>();
+      realExpenses.forEach(e => paidBySet.add(e.paidBy));
+      const paidByUsers = Array.from(paidBySet);
+      
+      const splitSet = new Set<number>();
+      relevantSplits.forEach(s => splitSet.add(s.userId));
+      const splitUsers = Array.from(splitSet);
+      
+      const allUsersSet = new Set<number>();
+      memberIds.forEach(id => allUsersSet.add(id));
+      paidByUsers.forEach(id => allUsersSet.add(id));
+      splitUsers.forEach(id => allUsersSet.add(id));
+      const allInvolvedUsers = Array.from(allUsersSet);
+      
+      // Calculate balances for all involved users (including removed ones)
+      const balances = [];
+      
+      for (const userId of allInvolvedUsers) {
+        const memberUser = await this.getUser(userId);
+        const isCurrentMember = memberIds.includes(userId);
+        
+        // Amount they paid out (only real expenses they covered)
+        const totalPaid = realExpenses
+          .filter(e => e.paidBy === userId)
+          .reduce((sum, e) => sum + parseFloat(e.amount.toString()), 0);
+        
+        // Amount they owe (their share of all real expenses)
+        const totalOwed = relevantSplits
+          .filter(split => split.userId === userId)
+          .reduce((sum, split) => sum + parseFloat(split.amount.toString()), 0);
+        
+        const netBalance = Math.round((totalPaid - totalOwed) * 100) / 100;
+        console.log(`${memberUser?.name}: paid ${totalPaid}, owes ${totalOwed}, net ${netBalance}`);
+        
+        // For removed users, only include them if they have outstanding financial obligations
+        if (!isCurrentMember && Math.abs(netBalance) < 0.01) {
+          console.log(`Skipping removed user ${memberUser?.name} with zero balance`);
+          continue; // Skip removed users with no meaningful financial involvement
+        }
+
+        balances.push({
+          userId: userId,
+          name: memberUser?.name || memberUser?.username || 'Unknown',
+          totalPaid: Math.round(totalPaid * 100) / 100,
+          totalOwed: Math.round(totalOwed * 100) / 100,
+          netBalance: netBalance,
+          isCurrentMember: isCurrentMember,
+          isLegacyRemoved: memberUser?.legacyRemoved || false,
+          isDeleted: !!memberUser?.deletedAt // Mark deleted users for filtering
+        });
+      }
+
+      // Account for confirmed settlements
+      const confirmedSettlements = await db
+        .select()
+        .from(settlements)
+        .where(
+          and(
+            eq(settlements.tripId, tripId),
+            eq(settlements.status, 'confirmed')
+          )
+        );
+
+      // Adjust balances based on confirmed settlements
+      console.log(`Processing ${confirmedSettlements.length} settlements for trip ${tripId}`);
+      console.log('Balances before settlements:', balances.map(b => `${b.name}: ${b.netBalance}`));
+      
+      for (const settlement of confirmedSettlements) {
+        const payerBalance = balances.find(b => b.userId === settlement.payerId);
+        const payeeBalance = balances.find(b => b.userId === settlement.payeeId);
+        const settledAmount = parseFloat(settlement.amount);
+        
+        console.log(`Settlement: ${settlement.payerId} paid ${settledAmount} to ${settlement.payeeId}`);
+        
+        if (payerBalance) {
+          const oldBalance = payerBalance.netBalance;
+          // Payer's debt is reduced (they paid money they owed)
+          // If they had negative balance (owed money), this moves them towards 0
+          payerBalance.netBalance = Math.round((payerBalance.netBalance + settledAmount) * 100) / 100;
+          console.log(`Payer ${payerBalance.name}: ${oldBalance} → ${payerBalance.netBalance}`);
+        }
+
+        if (payeeBalance) {
+          const oldBalance = payeeBalance.netBalance;
+          // Payee's credit is reduced (they received money they were owed)
+          // If they had positive balance (were owed money), this moves them towards 0
+          payeeBalance.netBalance = Math.round((payeeBalance.netBalance - settledAmount) * 100) / 100;
+          console.log(`Payee ${payeeBalance.name}: ${oldBalance} → ${payeeBalance.netBalance}`);
+        }
+      }
+      
+      console.log('Final balances after settlements:', balances.map(b => `${b.name}: ${b.netBalance}`));
+
+      return balances;
+    } catch (error) {
+      safeErrorLog('Error in calculateExpenseBalances', error);
+      return [];
+    }
+  }
+
+  async markExpenseSharePaid(expenseId: number, shareId: number): Promise<void> {
+    await db
+      .update(expenseSplits)
+      .set({ 
+        isPaid: true, 
+        paidAt: new Date() 
+      })
+      .where(eq(expenseSplits.id, shareId));
+  }
+
+  async removeExpenseSplits(expenseId: number): Promise<void> {
+    await db
+      .delete(expenseSplits)
+      .where(eq(expenseSplits.expenseId, expenseId));
+  }
+
+  async getExpenseSplits(expenseId: number): Promise<any[]> {
+    return await db.select().from(expenseSplits).where(eq(expenseSplits.expenseId, expenseId));
+  }
+
+  async removeUserFromExpenseSplit(expenseId: number, userId: number): Promise<void> {
+    await db.delete(expenseSplits)
+      .where(and(eq(expenseSplits.expenseId, expenseId), eq(expenseSplits.userId, userId)));
+  }
+
+  async getExpense(id: number): Promise<any> {
+    const [expense] = await db
+      .select({
+        id: expenses.id,
+        tripId: expenses.tripId,
+        title: expenses.title,
+        amount: expenses.amount,
+        currency: expenses.currency,
+        category: expenses.category,
+        date: expenses.date,
+        description: expenses.description,
+        paidBy: expenses.paidBy,
+        activityId: expenses.activityId,
+        isSettled: expenses.isSettled,
+        receiptUrl: expenses.receiptUrl,
+        createdAt: expenses.createdAt,
+        updatedAt: expenses.updatedAt,
+        paidByUser: {
+          id: users.id,
+          name: users.name,
+          username: users.username,
+          email: users.email
+        }
+      })
+      .from(expenses)
+      .leftJoin(users, eq(expenses.paidBy, users.id))
+      .where(eq(expenses.id, id));
+    
+    if (!expense) return null;
+
+    // Get expense splits with user details
+    const splits = await db
+      .select({
+        id: expenseSplits.id,
+        userId: expenseSplits.userId,
+        amount: expenseSplits.amount,
+        isPaid: expenseSplits.isPaid,
+        paidAt: expenseSplits.paidAt,
+        user: {
+          id: users.id,
+          name: users.name,
+          username: users.username,
+          email: users.email
+        }
+      })
+      .from(expenseSplits)
+      .leftJoin(users, eq(expenseSplits.userId, users.id))
+      .where(eq(expenseSplits.expenseId, id));
+
+    // Get activity details if linked
+    let activity = null;
+    if (expense.activityId) {
+      const [activityResult] = await db
+        .select()
+        .from(activities)
+        .where(eq(activities.id, expense.activityId));
+      activity = activityResult;
+    }
+
+    return {
+      ...expense,
+      shares: splits,
+      splits: splits,
+      activity
+    };
+  }
+
+  async updateExpense(id: number, data: any): Promise<any> {
+    const [expense] = await db
+      .update(expenses)
+      .set(data)
+      .where(eq(expenses.id, id))
+      .returning();
+    return expense;
+  }
+
+  async deleteExpense(id: number): Promise<boolean> {
+    // First delete expense splits
+    await this.removeExpenseSplits(id);
+    
+    // Then delete the expense
+    const result = await db
+      .delete(expenses)
+      .where(eq(expenses.id, id));
+    
+    return true;
+  }
+
+
+
+  // Add missing methods for app functionality
+  async getUserTripSettings(userId: number, tripId: number): Promise<any> {
+    const [settings] = await db
+      .select()
+      .from(userTripSettings)
+      .where(
+        and(
+          eq(userTripSettings.userId, userId),
+          eq(userTripSettings.tripId, tripId)
+        )
+      );
+    return settings || null;
+  }
+
+  async createOrUpdateUserTripSettings(settings: { userId: number, tripId: number, isPinned?: boolean, isArchived?: boolean }): Promise<any> {
+    try {
+      if (settings.isPinned === undefined && settings.isArchived === undefined) {
+        throw new Error('No values to set: isPinned or isArchived must be provided');
+      }
+      // Check if settings already exist
+      const [existing] = await db
+        .select()
+        .from(userTripSettings)
+        .where(
+          and(
+            eq(userTripSettings.userId, settings.userId),
+            eq(userTripSettings.tripId, settings.tripId)
+          )
+        );
+      if (existing) {
+        // Only update fields that are defined, always include updatedAt
+        const updateData: any = { updatedAt: new Date() };
+        if (settings.isPinned !== undefined) updateData.isPinned = settings.isPinned;
+        if (settings.isArchived !== undefined) updateData.isArchived = settings.isArchived;
+        if (Object.keys(updateData).length === 1) { // Only updatedAt
+          throw new Error('No values to set: isPinned or isArchived must be provided');
+        }
+        const [updated] = await db
+          .update(userTripSettings)
+          .set(updateData)
+          .where(
+            and(
+              eq(userTripSettings.userId, settings.userId),
+              eq(userTripSettings.tripId, settings.tripId)
+            )
+          )
+          .returning();
+        return updated;
+      } else {
+        // Create new settings
+        const [newSettings] = await db
+          .insert(userTripSettings)
+          .values({
+            userId: settings.userId,
+            tripId: settings.tripId,
+            isPinned: settings.isPinned ?? false,
+            isArchived: settings.isArchived ?? false,
+            createdAt: new Date(),
+            updatedAt: new Date()
+          })
+          .returning();
+        return newSettings;
+      }
+    } catch (error) {
+      safeErrorLog('Error in createOrUpdateUserTripSettings', error);
+      throw error;
+    }
+  }
+
+  async getPollsByTrip(tripId: number): Promise<any[]> {
+    return await db
+      .select()
+      .from(polls)
+      .where(eq(polls.tripId, tripId))
+      .orderBy(desc(polls.createdAt));
+  }
+
+  async createInvitationLink(invitation: InsertInvitationLink): Promise<InvitationLink> {
+    const [link] = await db
+      .insert(invitationLinks)
+      .values(invitation)
+      .returning();
+    
+    return link;
+  }
+
+  async getInvitationLinksByTrip(tripId: number): Promise<InvitationLink[]> {
+    return await db
+      .select()
+      .from(invitationLinks)
+      .where(
+        and(
+          eq(invitationLinks.tripId, tripId),
+          eq(invitationLinks.isActive, true)
+        )
+      );
+  }
+
+  async getInvitationLink(token: string): Promise<InvitationLink | undefined> {
+    const [link] = await db
+      .select()
+      .from(invitationLinks)
+      .where(eq(invitationLinks.token, token));
+    
+    return link || undefined;
+  }
+
+
+
+  async createFlightInfo(data: any): Promise<any> {
+    return { id: 1, ...data };
+  }
+
+  async getFlightInfoByTrip(tripId: number): Promise<any[]> {
+    return [];
+  }
+
+  async getFlightInfo(id: number): Promise<any> {
+    return null;
+  }
+
+  async updateFlightInfo(id: number, data: any): Promise<any> {
+    return null;
+  }
+
+  async deleteFlightInfo(id: number): Promise<boolean> {
+    return true;
+  }
+
+  async searchFlights(query: any): Promise<any[]> {
+    return [];
+  }
+
+  async createPoll(data: any): Promise<any> {
+    const [newPoll] = await db
+      .insert(polls)
+      .values(data)
+      .returning();
+    return newPoll;
+  }
+
+  async getPollVotes(pollId: number): Promise<any[]> {
+    return await db
+      .select()
+      .from(pollVotes)
+      .where(eq(pollVotes.pollId, pollId));
+  }
+
+  async getUserPollVotes(pollId: number, userId: number): Promise<any[]> {
+    return await db
+      .select()
+      .from(pollVotes)
+      .where(and(eq(pollVotes.pollId, pollId), eq(pollVotes.userId, userId)));
+  }
+
+  async getPoll(id: number): Promise<any> {
+    const [poll] = await db.select().from(polls).where(eq(polls.id, id));
+    return poll || null;
+  }
+
+  async deletePollVote(voteId: number): Promise<boolean> {
+    await db.delete(pollVotes).where(eq(pollVotes.id, voteId));
+    return true;
+  }
+
+  async createPollVote(data: any): Promise<any> {
+    const [newVote] = await db
+      .insert(pollVotes)
+      .values(data)
+      .returning();
+    return newVote;
+  }
+
+  // Settlement methods
+  async createSettlement(settlement: InsertSettlement): Promise<Settlement> {
+    const [newSettlement] = await db
+      .insert(settlements)
+      .values(settlement)
+      .returning();
+    return newSettlement;
+  }
+
+  async getSettlementsByTrip(tripId: number): Promise<Settlement[]> {
+    return await db
+      .select()
+      .from(settlements)
+      .where(eq(settlements.tripId, tripId))
+      .orderBy(desc(settlements.createdAt));
+  }
+
+  async getSettlement(id: number): Promise<Settlement | undefined> {
+    const [settlement] = await db.select().from(settlements).where(eq(settlements.id, id));
+    return settlement || undefined;
+  }
+
+  async updateSettlement(id: number, data: Partial<Settlement>): Promise<Settlement | undefined> {
+    const [updated] = await db
+      .update(settlements)
+      .set(data)
+      .where(eq(settlements.id, id))
+      .returning();
+    return updated || undefined;
+  }
+
+  async confirmSettlement(settlementId: number, confirmedBy: number): Promise<Settlement | undefined> {
+    const [confirmed] = await db
+      .update(settlements)
+      .set({
+        status: 'confirmed',
+        confirmedAt: new Date(),
+        confirmedBy: confirmedBy,
+        updatedAt: new Date()
+      })
+      .where(eq(settlements.id, settlementId))
+      .returning();
+    return confirmed || undefined;
+  }
+
+  async rejectSettlement(settlementId: number, rejectedBy: number): Promise<Settlement | undefined> {
+    const [rejected] = await db
+      .update(settlements)
+      .set({
+        status: 'rejected',
+        rejectedAt: new Date(),
+        rejectedBy: rejectedBy,
+        updatedAt: new Date()
+      })
+      .where(eq(settlements.id, settlementId))
+      .returning();
+    return rejected || undefined;
+  }
+
+  async getPendingSettlementsForUser(userId: number): Promise<Settlement[]> {
+    console.log("Getting pending settlements for user:", userId);
+    
+    const results = await db
+      .select()
+      .from(settlements)
+      .where(
+        and(
+          eq(settlements.status, 'pending'),
+          eq(settlements.payeeId, userId)
+        )
+      )
+      .orderBy(desc(settlements.createdAt));
+    
+    console.log("Found pending settlements:", results.length, "for user:", userId);
+    console.log("Settlement details:", results.map(s => ({
+      id: s.id,
+      payerId: s.payerId,
+      payeeId: s.payeeId,
+      status: s.status,
+      amount: s.amount
+    })));
+    
+    return results;
+  }
+
+  /**
+   * Get all trips where user has unsettled balances
+   * Returns array of trips with balance information
+   */
+  async getTripsWithUnsettledBalances(userId: number): Promise<Array<{ tripId: number; tripName: string; balance: number; message: string }>> {
+    try {
+      const userTrips = await this.getTripsByUser(userId);
+      const tripsWithBalances: Array<{ tripId: number; tripName: string; balance: number; message: string }> = [];
+
+      for (const trip of userTrips) {
+        const balances = await this.calculateExpenseBalances(trip.id);
+        const userBalance = balances.find(b => b.userId === userId);
+        
+        if (userBalance && Math.abs(userBalance.netBalance) >= 0.01) {
+          const message = userBalance.netBalance > 0
+            ? `You're owed $${Math.abs(userBalance.netBalance).toFixed(2)}. You can leave, but you'll lose this money.`
+            : `You owe $${Math.abs(userBalance.netBalance).toFixed(2)}. You must settle this before deleting your account.`;
+          
+          tripsWithBalances.push({
+            tripId: trip.id,
+            tripName: trip.name || 'Unnamed Trip',
+            balance: userBalance.netBalance,
+            message: message
+          });
+        }
+      }
+
+      return tripsWithBalances;
+    } catch (error) {
+      safeErrorLog('Error getting trips with unsettled balances', error);
+      return [];
+    }
+  }
+
+  // Auto-archive all trips for a user where the end date is in the past and not already archived for the user.
+  async autoArchivePastTripsForUser(userId: number): Promise<void> {
+    const now = new Date();
+    // Get all trips for the user
+    const trips = await this.getTripsByUser(userId);
+    for (const trip of trips) {
+      if (trip.endDate && new Date(trip.endDate) < now) {
+        // Check user trip settings
+        const settings = await this.getUserTripSettings(userId, trip.id);
+        if (!settings || !settings.isArchived) {
+          await this.createOrUpdateUserTripSettings({
+            userId,
+            tripId: trip.id,
+            isArchived: true
+          });
+        }
+      }
+    }
+  }
+
+  // Get all messages (for migration purposes)
+  async getAllMessages(): Promise<any[]> {
+    return await db.select().from(messages);
+  }
+
+  // Update a message (for migration purposes)
+  async updateMessage(id: number, data: Partial<any>): Promise<any | undefined> {
+    const [updated] = await db
+      .update(messages)
+      .set(data)
+      .where(eq(messages.id, id))
+      .returning();
+    return updated || undefined;
+  }
+
+  async createNotification(notification: {
+    userId: number;
+    type: string;
+    title: string;
+    message: string;
+    data?: any;
+  }): Promise<Notification> {
+    const [newNotification] = await db
+      .insert(notifications)
+      .values({
+        ...notification,
+        data: notification.data ? JSON.stringify(notification.data) : null,
+        createdAt: new Date()
+      })
+      .returning();
+    
+    return newNotification;
+  }
+
+  async getUserNotifications(userId: number): Promise<Notification[]> {
+    return await db
+      .select()
+      .from(notifications)
+      .where(eq(notifications.userId, userId))
+      .orderBy(desc(notifications.createdAt));
+  }
+
+  async markNotificationAsRead(notificationId: number, userId: number): Promise<Notification | undefined> {
+    const [updatedNotification] = await db
+      .update(notifications)
+      .set({ isRead: true })
+      .where(
+        and(
+          eq(notifications.id, notificationId),
+          eq(notifications.userId, userId)
+        )
+      )
+      .returning();
+    
+    return updatedNotification || undefined;
+  }
+}
+
+export const storage = new DatabaseStorage();

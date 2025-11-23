@@ -1,0 +1,95 @@
+import { Switch, Route } from "wouter";
+import { Toaster } from "@/components/ui/toaster";
+import { TooltipProvider } from "@/components/ui/tooltip";
+import OnboardingTooltips from "@/components/OnboardingTooltips";
+import NotFound from "@/pages/not-found";
+import Home from "@/pages/home";
+import Landing from "@/pages/landing";
+import About from "@/pages/about";
+import Contact from "@/pages/contact";
+import Terms from "@/pages/terms";
+import Privacy from "@/pages/privacy";
+import Legal from "@/pages/legal";
+import Login from "@/pages/login";
+import Register from "@/pages/register";
+import TripDetails from "@/pages/trip-details";
+import CreateTrip from "@/pages/create-trip";
+import Chat from "@/pages/chat";
+import Chats from "@/pages/chats";
+import TripsCalendar from "@/pages/trips-calendar";
+import Itinerary from "@/pages/itinerary";
+import Flights from "@/pages/flights";
+import TripBudget from "@/pages/trip-budget";
+import TripExpenses from "@/pages/expenses";
+import Polls from "@/pages/polls";
+import InvitationPage from "@/pages/invitation";
+import Profile from "@/pages/profile";
+import AccountSettings from "@/pages/account-settings";
+import UserProfile from "@/pages/user-profile";
+import BudgetDashboard from "@/pages/budget-dashboard";
+import ActivityDetails from "@/pages/activity-details";
+import ExpenseTracker from "@/pages/expense-tracker";
+import ExpenseDetails from "@/pages/expense-details";
+import ForgotPassword from "@/pages/forgot-password";
+import ResetPassword from "@/pages/reset-password";
+import ConfirmEmail from "@/pages/confirm-email";
+import RecoverAccount from "@/pages/recover-account";
+import AirportTest from "@/pages/airport-test";
+import DeleteAccount from "@/pages/delete-account";
+import OutstandingBalances from "@/pages/outstanding-balances";
+
+function Router() {
+  return (
+    <Switch>
+      <Route path="/" component={Landing} />
+      <Route path="/about" component={About} />
+      <Route path="/contact" component={Contact} />
+      <Route path="/terms" component={Terms} />
+      <Route path="/privacy" component={Privacy} />
+      <Route path="/legal" component={Legal} />
+      <Route path="/login" component={Login} />
+      <Route path="/register" component={Register} />
+      <Route path="/dashboard" component={Home} />
+      <Route path="/create-trip" component={CreateTrip} />
+      <Route path="/trips/:id" component={TripDetails} />
+      <Route path="/trips/:id/chat" component={Chat} />
+      <Route path="/trips/:id/itinerary" component={Itinerary} />
+      <Route path="/trips/:id/flights" component={Flights} />
+      <Route path="/trips/:id/budget" component={TripBudget} />
+      <Route path="/trips/:id/expenses" component={TripExpenses} />
+      <Route path="/trips/:id/expense-tracker" component={ExpenseTracker} />
+      <Route path="/trips/:id/polls" component={Polls} />
+      <Route path="/chats" component={Chats} />
+      <Route path="/trips" component={TripsCalendar} />
+      <Route path="/chat/:id" component={Chat} />
+      <Route path="/invite/:token" component={InvitationPage} />
+      <Route path="/budget-dashboard" component={BudgetDashboard} />
+      <Route path="/activities/:activityId" component={ActivityDetails} />
+      <Route path="/trips/:tripId/activities/:activityId" component={ActivityDetails} />
+      <Route path="/trips/:tripId/expenses/:expenseId" component={ExpenseDetails} />
+      <Route path="/profile" component={Profile} />
+      <Route path="/outstanding-balances" component={OutstandingBalances} />
+      <Route path="/account-settings" component={AccountSettings} />
+      <Route path="/delete-account" component={DeleteAccount} />
+      <Route path="/user/:userId" component={UserProfile} />
+      <Route path="/forgot-password" component={ForgotPassword} />
+      <Route path="/reset-password" component={ResetPassword} />
+      <Route path="/confirm-email" component={ConfirmEmail} />
+      <Route path="/recover-account" component={RecoverAccount} />
+      <Route path="/airport-test" component={AirportTest} />
+      <Route component={NotFound} />
+    </Switch>
+  );
+}
+
+function App() {
+  return (
+    <TooltipProvider>
+      <Toaster />
+      <Router />
+      <OnboardingTooltips />
+    </TooltipProvider>
+  );
+}
+
+export default App;
